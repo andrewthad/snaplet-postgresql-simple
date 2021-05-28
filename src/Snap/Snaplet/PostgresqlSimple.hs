@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE FlexibleInstances   #-}
+{-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -85,6 +86,8 @@ module Snap.Snaplet.PostgresqlSimple (
   -- * Wrappers and re-exports
   , query
   , query_
+  , preparedQuery
+  , preparedQuery_
   , fold
   , foldWithOptions
   , fold_
@@ -94,6 +97,7 @@ module Snap.Snaplet.PostgresqlSimple (
   , execute
   , execute_
   , executeMany
+  , preparedExecute
   , returning
   , withTransaction
   , withTransactionLevel
@@ -134,7 +138,7 @@ module Snap.Snaplet.PostgresqlSimple (
 
 import qualified Control.Exception                      as E
 import           Control.Lens                           (set, (^#))
-import           Control.Monad                          (liftM)
+import           Control.Monad                          (liftM,forM,forM_)
 import           Control.Monad.IO.Class                 (MonadIO, liftIO)
 import           Control.Monad.Reader                   (ReaderT, ask, asks,
                                                          local)
@@ -142,9 +146,12 @@ import           Control.Monad.State                    (get)
 import           Control.Monad.Trans.Control            (MonadBaseControl,
                                                          liftBaseWith, restoreM)
 import           Data.ByteString                        (ByteString)
+import qualified Data.ByteString                        as B
+import qualified Data.ByteString.Char8                  as BC8
 import qualified Data.Configurator                      as C
 import qualified Data.Configurator.Types                as C
 import           Data.Int                               (Int64)
+import qualified Data.List                              as L
 import           Data.Monoid                            (Monoid (..), (<>))
 import           Data.Pool                              (createPool)
 import           Data.Ratio                             (denominator, numerator)
@@ -154,14 +161,17 @@ import qualified Data.Text.Lazy                         as TL
 import qualified Data.Text.Lazy.Builder                 as TB
 import qualified Data.Text.Lazy.Builder.Int             as TB
 import qualified Data.Text.Lazy.Builder.RealFloat       as TB
+import qualified Database.PostgreSQL.LibPQ              as LibPQ
 import qualified Database.PostgreSQL.Simple             as P
 import           Database.PostgreSQL.Simple.FromRow
 import           Database.PostgreSQL.Simple.ToRow
+import qualified Database.PostgreSQL.Simple.Internal    as P
 import qualified Database.PostgreSQL.Simple.Transaction as P
 import           Paths_snaplet_postgresql_simple
 import           Prelude                                hiding ((++))
 import qualified Snap                                   as Snap
 import           Snap.Snaplet.PostgresqlSimple.Internal
+import qualified System.Directory                       as Directory
 
 ------------------------------------------------------------------------------
 -- | Default instance
@@ -286,14 +296,16 @@ datadir = Just $ liftM (<>"/resources/db") getDataDir
 pgsInit :: Snap.SnapletInit b Postgres
 pgsInit = Snap.makeSnaplet "postgresql-simple" description datadir $ do
     config <- mkPGSConfig =<< Snap.getSnapletUserConfig
-    initHelper config
+    dir <- Snap.getSnapletFilePath
+    initHelper config dir
 
 
 ------------------------------------------------------------------------------
 -- | Initialize the snaplet using a specific configuration.
 pgsInit' :: PGSConfig -> Snap.SnapletInit b Postgres
-pgsInit' config = Snap.makeSnaplet "postgresql-simple" description Nothing $
-    initHelper config
+pgsInit' config = Snap.makeSnaplet "postgresql-simple" description Nothing $ do
+    dir <- Snap.getSnapletFilePath
+    initHelper config dir
 
 
 ------------------------------------------------------------------------------
@@ -310,13 +322,48 @@ mkPGSConfig config = liftIO $ do
     return $ PGSConfig connstr stripes idle resources
 
 
-initHelper :: MonadIO m => PGSConfig -> m Postgres
-initHelper PGSConfig{..} = do
-    pool <- liftIO $ createPool (P.connectPostgreSQL pgsConnStr) P.close
-                                pgsNumStripes (realToFrac pgsIdleTime)
-                                pgsResources
+initHelper :: MonadIO m => PGSConfig -> FilePath -> m Postgres
+initHelper PGSConfig{..} dir = liftIO $ do
+    let preparedStatementDir = dir <> "/prepared-statements/"
+    putStrLn ("Prepared statements dir at: " <> preparedStatementDir)
+    statements <- Directory.doesDirectoryExist preparedStatementDir >>= \case
+        True -> loadPreparedStatements preparedStatementDir
+        False -> return []
+    pool <- createPool
+        (P.connectPostgreSQL pgsConnStr >>= prepareMany statements)
+        P.close pgsNumStripes (realToFrac pgsIdleTime) pgsResources
     return $ PostgresPool pool
 
+data PreparedStatement = PreparedStatement
+  !ByteString -- name
+  !ByteString -- query
+
+loadPreparedStatements :: FilePath -> IO [PreparedStatement]
+loadPreparedStatements dir = do
+  putStrLn "Prepared statements directory exists!"
+  allFiles <- Directory.listDirectory dir
+  let sqlFiles = [file | file <- allFiles, ".sql" `L.isSuffixOf` file]
+  putStrLn ("Found " <> show (length sqlFiles) <> " sql files")
+  forM sqlFiles $ \sqlFile -> do
+    theQuery <- B.readFile (dir <> sqlFile)
+    let name = T.encodeUtf8 (T.dropEnd 4 (T.pack sqlFile))
+    return (PreparedStatement name theQuery)
+
+prepareMany :: [PreparedStatement] -> P.Connection -> IO P.Connection
+prepareMany statements conn = P.withConnection conn $ \conn' -> do
+    forM_ statements $ \(PreparedStatement name theQuery) -> do
+        LibPQ.prepare conn' name theQuery Nothing >>= \case
+            Nothing -> fail "Failed to send a prepared statement"
+            Just res -> LibPQ.resultStatus res >>= \case
+              P.CommandOk -> pure ()
+              e -> fail ("Prepared statement creation failure: [statement=" <> BC8.unpack name <> "][error= " <> show e <> "]")
+    return conn
+
+preparedQuery :: (HasPostgres m, ToRow q, FromRow r) => ByteString -> q -> m [r]
+preparedQuery q params = liftPG' (\c ->  P.preparedQuery c q params)
+
+preparedQuery_ :: (HasPostgres m, FromRow r) => ByteString -> m [r]
+preparedQuery_ q = liftPG' (\c ->  P.preparedQuery_ c q)
 
 ------------------------------------------------------------------------------
 -- | See 'P.query'
@@ -419,6 +466,12 @@ execute_ template = liftPG' (`P.execute_` template)
 executeMany :: (HasPostgres m, ToRow q)
         => P.Query -> [q] -> m Int64
 executeMany template qs = liftPG' (\c -> P.executeMany c template qs)
+
+------------------------------------------------------------------------------
+-- |
+preparedExecute :: (HasPostgres m, ToRow q)
+                => ByteString -> q -> m Int64
+preparedExecute template qs = liftPG' (\c -> P.preparedExecute c template qs)
 
 
 ------------------------------------------------------------------------------
